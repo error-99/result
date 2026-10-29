@@ -1,0 +1,4 @@
+flask>=3.0,<4
+requests>=2.31,<3
+waitress>=3.0,<4
+aiogram>=3.7,<4
