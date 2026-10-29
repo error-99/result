@@ -209,9 +209,35 @@ Replies:
 
 `404` if the job is unknown or older than `JOB_TTL`.
 
-### `GET /health`
+### `GET /health`: is everything alive?
 
-Counters always. With a valid token it also probes every result site and every Gemini key (cached `HEALTH_CACHE_TTL` seconds). Add `?probe=0` to skip probes or `?fresh=1` to force new ones. Always returns HTTP 200: read `"status"` (`ok` or `degraded`).
+Open it in a **browser** and you get a status page; scripts (`curl`) get JSON. It checks every result server and every Gemini key (results are cached `HEALTH_CACHE_TTL` seconds, so refreshing is cheap) and shows:
+
+- **Result servers: X up / Y total**, with each server's state and response time
+- **Gemini keys: X alive / Y total**, split into *working*, *rate-limited* (good key, Google is throttling it for a moment), *rejected*, and *unreachable*
+- Overall `status`: `ok`, `degraded` (something is down, but jobs still work), or `down` (no server or no key usable)
+- Queue sizes, worker threads, uptime, model
+
+Example JSON (shortened):
+
+```json
+{
+  "status": "degraded",
+  "sites_up": 1, "sites_total": 2,
+  "keys_alive": 3, "keys_rate_limited": 1, "keys_invalid": 0, "keys_unreachable": 0, "keys_total": 4,
+  "sites": [{"site": "...", "up": true, "ms": 310}, {"site": "...", "up": false, "detail": "down or challenge failed"}],
+  "queue_depth": 0, "callback_depth": 0
+}
+```
+
+| Who | What they see |
+|---|---|
+| Anyone (no token) | Server up/down and **counts** of keys. Never any key text |
+| With your `API_TOKEN` | Also a list of each key's last characters, state, speed, and cooldown. Send the token as header `X-API-Key`, or in a browser use `/health?token=YOUR_API_TOKEN` |
+
+Options: `?format=json` or `?format=html` to force a format, `?probe=0` for counters only, `?fresh=1` to force a new check (token required). Always returns HTTP 200: read `"status"`. The page refreshes itself every 30 seconds.
+
+> `?token=` puts the token in the URL (browser history, proxy logs). Use it only on your own devices.
 
 ### `GET /ready`
 
@@ -481,6 +507,12 @@ gunicorn -w 1 --threads 8 -b 0.0.0.0:5000 main:APP
 ```
 
 Always `-w 1` (one process).
+
+### Render specifics
+
+- **Keys added with `/addkey` are lost on redeploy** because Render's disk is temporary. Put your keys in the `GEMINI_KEYS` environment variable (comma-separated), or attach a persistent disk and set `KEYS_FILE` to a path on it.
+- During a deploy, Render may briefly run the old and new instance together. The bot then logs `TelegramConflictError` for a few seconds and recovers on its own.
+- Use `/ready` as the health check path. Keep one instance only.
 
 ### Good to know
 

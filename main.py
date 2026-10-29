@@ -408,7 +408,29 @@ def retry_after(resp: requests.Response, default: int) -> int:
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 
 
+_GENERATE_ONLY_KEYS: set = set()   # keys the metadata check rejects but generateContent accepts
+
+
 def probe_key(key: str, deep: bool = False) -> Dict[str, Any]:
+    """Check one Gemini key. If the cheap metadata check says "invalid", confirm it with ONE tiny real
+    generateContent call before condemning the key (protects newer key formats from a false "invalid")."""
+    if not deep and key in _GENERATE_ONLY_KEYS:
+        return {"id": key_id(key), "tag": key_tag(key), "deep": False, "state": "valid", "http": 200,
+                "ms": 0, "detail": "quick check skipped (key verified by a real call)"}
+    out = _probe_key_once(key, deep)
+    if not deep and out["state"] == "invalid":
+        real = _probe_key_once(key, True)
+        if real["state"] in ("valid", "rate_limited"):
+            _GENERATE_ONLY_KEYS.add(key)
+            log.info("key%s fails the metadata check but works for generateContent - accepted", key_tag(key))
+            real["deep"] = False
+            real["detail"] = "works for generateContent (metadata check not supported by this key)"
+            return real
+        return real if real["state"] != "error" else out
+    return out
+
+
+def _probe_key_once(key: str, deep: bool = False) -> Dict[str, Any]:
     """
     Check one Gemini key.
       quick (deep=False): GET model metadata - validates the key without using generation quota.
@@ -1448,13 +1470,16 @@ def build_digest(title: str = "📊 <b>Hourly digest</b>") -> str:
     return "\n".join(lines)
 
 
-def health_snapshot(probe: bool = True, fresh: bool = False) -> Dict[str, Any]:
+def health_snapshot(probe: bool = True, fresh: bool = False, detail: bool = True) -> Dict[str, Any]:
+    """detail=False (public view): counts and site up/down only - no key tags or key details."""
     alive = sum(1 for t in _THREADS if t.is_alive())
     data: Dict[str, Any] = {
-        "status": "ok", "queue_depth": JOB_Q.qsize(), "callback_depth": CB_Q.qsize(),
+        "status": "ok", "model": MODEL, "uptime_s": int(time.time() - START_TIME),
+        "queue_depth": JOB_Q.qsize(), "callback_depth": CB_Q.qsize(),
         "keys": len(POOL.keys), "keys_available": POOL.available(),
         "threads_alive": alive, "jobs_tracked": JOBS.size()}
     degraded = alive < WORKERS + CB_WORKERS or POOL.available() == 0
+    down = False
     if probe:
         pr = get_probe(fresh)
         cool = {k["id"]: k for k in POOL.status()}
@@ -1464,14 +1489,89 @@ def health_snapshot(probe: bool = True, fresh: bool = False) -> Dict[str, Any]:
             keys.append({"key": k["tag"], "state": k["state"], "http": k.get("http"), "ms": k.get("ms"),
                          "detail": k.get("detail", ""), "in_cooldown": not c.get("available", True),
                          "cooldown_s": int(c.get("cool_left", 0))})
-        data["sites"] = pr["sites"]
-        data["gemini_keys"] = keys
+        sites = pr["sites"]
+        n_up = sum(1 for x in sites if x["up"])
+        states = [k["state"] for k in pr["keys"]]
+        n_valid = states.count("valid")
+        n_rate = states.count("rate_limited")
+        n_invalid = states.count("invalid")
+        data["sites"] = sites
+        data["sites_total"], data["sites_up"], data["sites_down"] = len(sites), n_up, len(sites) - n_up
+        data["keys_total"] = len(states)
+        data["keys_alive"] = n_valid                    # work right now
+        data["keys_rate_limited"] = n_rate              # good key, Google is throttling it for a moment
+        data["keys_invalid"] = n_invalid                # rejected by Google
+        data["keys_unreachable"] = len(states) - n_valid - n_rate - n_invalid   # network/server/model errors
+        if detail:
+            data["gemini_keys"] = keys
         data["probed_age_s"] = int(time.time() - pr["ts"])
-        if not any(s["up"] for s in pr["sites"]) or not any(key_usable(k["state"]) for k in pr["keys"]):
+        if n_up < len(sites) or n_valid + n_rate < len(states):
             degraded = True
-    if degraded:
+        if n_up == 0 or n_valid + n_rate == 0:
+            down = True
+    if down:
+        data["status"] = "down"
+    elif degraded:
         data["status"] = "degraded"
     return data
+
+
+def render_health_html(h: Dict[str, Any], detail: bool) -> str:
+    """Small self-contained status page for browsers (light/dark aware, auto-refresh)."""
+    status = h["status"]
+    color = {"ok": "#1a7f37", "degraded": "#b26a00", "down": "#c62828"}.get(status, "#555")
+    rows = ""
+    for x in h.get("sites", []):
+        ms = f"{x['ms']} ms" if x.get("ms") is not None else "-"
+        rows += (f"<tr><td>{'🟢' if x['up'] else '🔴'} {esc(x['site'])}</td>"
+                 f"<td>{'UP' if x['up'] else 'DOWN'}</td><td>{ms}</td><td>{esc(x.get('detail', ''))}</td></tr>")
+    krows = ""
+    for k in h.get("gemini_keys", []):
+        good = key_usable(k["state"])
+        cool = f"cooling {k['cooldown_s']}s" if k["in_cooldown"] else ""
+        krows += (f"<tr><td>{'🟢' if good else '🔴'} <code>{esc(k['key'])}</code></td><td>{esc(k['state'])}</td>"
+                  f"<td>{k['ms'] if k.get('ms') is not None else '-'} ms</td><td>{esc(cool or k.get('detail', ''))}</td></tr>")
+    up_h = f"{h['uptime_s'] // 3600}h {h['uptime_s'] % 3600 // 60}m"
+    keys_block = ""
+    if "keys_total" in h:
+        keys_block = (
+            f"<h2>Gemini keys: {h['keys_alive']} alive / {h['keys_total']} total</h2>"
+            f"<p class=m>working now <b>{h['keys_alive']}</b> · rate-limited (good, throttled) <b>{h['keys_rate_limited']}</b>"
+            f" · rejected <b>{h['keys_invalid']}</b> · unreachable <b>{h['keys_unreachable']}</b>"
+            f" · free to use right now <b>{h['keys_available']}</b></p>"
+            + (f"<table><tr><th>key</th><th>state</th><th>speed</th><th>note</th></tr>{krows}</table>"
+               if krows else "") 
+            + ("" if detail else "<p class=m>Key details are hidden. Add <code>?token=YOUR_API_TOKEN</code> to see them.</p>"))
+    sites_block = ""
+    if "sites_total" in h:
+        sites_block = (f"<h2>Result servers: {h['sites_up']} up / {h['sites_total']} total</h2>"
+                       f"<table><tr><th>server</th><th>state</th><th>speed</th><th>note</th></tr>{rows}</table>")
+    age = f" · checked {h['probed_age_s']}s ago" if "probed_age_s" in h else ""
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<title>Result service - {esc(status)}</title>
+<style>
+:root{{--bg:#f6f7f9;--card:#fff;--tx:#1b1f24;--mu:#5b6570;--bd:#dde1e6}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#12151a;--card:#1b2027;--tx:#e8ebef;--mu:#9aa5b1;--bd:#2c333c}}}}
+body{{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
+main{{max-width:760px;margin:0 auto;padding:20px 14px}}
+.card{{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px 18px;margin-bottom:14px}}
+.badge{{display:inline-block;padding:3px 12px;border-radius:99px;color:#fff;font-weight:700;background:{color}}}
+h1{{font-size:20px;margin:0 0 6px}} h2{{font-size:16px;margin:0 0 8px}}
+.m{{color:var(--mu);margin:4px 0 10px;font-size:13px}}
+table{{width:100%;border-collapse:collapse;font-size:14px}}
+th,td{{text-align:left;padding:6px 8px;border-top:1px solid var(--bd)}} th{{color:var(--mu);font-weight:600;border-top:0}}
+.wrap{{overflow-x:auto}} code{{font-size:13px}}
+</style></head><body><main>
+<div class="card"><h1>Result service <span class="badge">{esc(status.upper())}</span></h1>
+<p class="m">model {esc(h.get('model', ''))} · uptime {up_h}{age} · auto-refresh 30s</p>
+<p class="m">queue {h['queue_depth']}/{QUEUE_MAX} · callbacks waiting {h['callback_depth']}
+ · threads {h['threads_alive']}/{WORKERS + CB_WORKERS} · jobs tracked {h['jobs_tracked']}</p></div>
+<div class="card wrap">{sites_block}</div>
+<div class="card wrap">{keys_block}</div>
+</main></body></html>"""
 
 
 def build_health_text(fresh: bool = True) -> str:
@@ -1696,13 +1796,29 @@ def job_status(job_id: str):
 @APP.get("/health")
 def health():
     """
-    Basic counters always. Live probes of the result sites and every Gemini key are added
-    (cached HEALTH_CACHE_TTL seconds) for authorized callers; ?probe=0 skips them, ?fresh=1 forces
-    a new probe. Always HTTP 200 - read "status" (ok / degraded); /ready is the 503 gate.
+    Open in a browser or call from a script. Shows whether every result server is up and how many
+    Gemini keys are alive (probes are cached HEALTH_CACHE_TTL seconds, so this is cheap to refresh).
+      public            server up/down + key COUNTS
+      with API token    also each key's tag/state/speed (header X-API-Key / Authorization, or ?token=)
+    Options: ?format=json|html (browsers get html automatically), ?probe=0 counters only,
+             ?fresh=1 force a new probe (token required).
+    Always HTTP 200 - read "status" (ok / degraded / down); /ready is the 503 gate.
     """
-    do_probe = request.args.get("probe", "1") != "0" and authorized()
-    fresh = request.args.get("fresh") == "1"
-    return jsonify(health_snapshot(do_probe, fresh))
+    supplied = request.args.get("token", "")
+    detail = authorized() or bool(API_TOKEN and supplied
+                                  and hmac.compare_digest(supplied.encode(), API_TOKEN.encode()))
+    do_probe = request.args.get("probe", "1") != "0"
+    fresh = request.args.get("fresh") == "1" and detail
+    data = health_snapshot(do_probe, fresh, detail)
+    fmt = request.args.get("format", "").lower()
+    if not fmt:
+        fmt = "html" if request.accept_mimetypes.best_match(["application/json", "text/html"]) == "text/html" else "json"
+    if fmt == "html":
+        resp = APP.response_class(render_health_html(data, detail), mimetype="text/html")
+    else:
+        resp = jsonify(data)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @APP.get("/ready")
