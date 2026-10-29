@@ -1793,32 +1793,50 @@ def job_status(job_id: str):
     return jsonify({"ok": True, **j})
 
 
-@APP.get("/health")
-def health():
-    """
-    Open in a browser or call from a script. Shows whether every result server is up and how many
-    Gemini keys are alive (probes are cached HEALTH_CACHE_TTL seconds, so this is cheap to refresh).
-      public            server up/down + key COUNTS
-      with API token    also each key's tag/state/speed (header X-API-Key / Authorization, or ?token=)
-    Options: ?format=json|html (browsers get html automatically), ?probe=0 counters only,
-             ?fresh=1 force a new probe (token required).
-    Always HTTP 200 - read "status" (ok / degraded / down); /ready is the 503 gate.
-    """
+def wants_html() -> bool:
+    """Is this a browser opening the page (a document), or a script/fetch/XHR wanting JSON?"""
+    fmt = request.args.get("format", "").lower()
+    if fmt in ("html", "json"):
+        return fmt == "html"
+    dest = request.headers.get("Sec-Fetch-Dest", "")      # sent by all modern browsers
+    if dest:
+        return dest in ("document", "iframe", "frame")     # "empty" = fetch()/XHR -> JSON
+    return "text/html" in request.headers.get("Accept", "")   # older browsers; curl sends */*
+
+
+def _health_response(force_html: bool = False):
     supplied = request.args.get("token", "")
     detail = authorized() or bool(API_TOKEN and supplied
                                   and hmac.compare_digest(supplied.encode(), API_TOKEN.encode()))
     do_probe = request.args.get("probe", "1") != "0"
     fresh = request.args.get("fresh") == "1" and detail
     data = health_snapshot(do_probe, fresh, detail)
-    fmt = request.args.get("format", "").lower()
-    if not fmt:
-        fmt = "html" if request.accept_mimetypes.best_match(["application/json", "text/html"]) == "text/html" else "json"
-    if fmt == "html":
+    if force_html or wants_html():
         resp = APP.response_class(render_health_html(data, detail), mimetype="text/html")
     else:
         resp = jsonify(data)
     resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Vary"] = "Accept, Sec-Fetch-Dest"        # proxies must not mix the two formats
     return resp
+
+
+@APP.get("/health")
+def health():
+    """
+    Browser (address bar) -> status page; script / fetch / curl -> JSON. Force one with ?format=html|json.
+      public            server up/down + key COUNTS
+      with API token    also each key's tag/state/speed (header X-API-Key / Authorization, or ?token=)
+    ?probe=0 counters only, ?fresh=1 force a new probe (token required).
+    Always HTTP 200 - read "status" (ok / degraded / down); /ready is the 503 gate.
+    """
+    return _health_response()
+
+
+@APP.get("/status")
+@APP.get("/")
+def status_page():
+    """Always the HTML status page (a normal document), whatever the client sends."""
+    return _health_response(force_html=True)
 
 
 @APP.get("/ready")

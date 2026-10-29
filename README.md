@@ -211,7 +211,7 @@ Replies:
 
 ### `GET /health`: is everything alive?
 
-Open it in a **browser** and you get a status page; scripts (`curl`) get JSON. It checks every result server and every Gemini key (results are cached `HEALTH_CACHE_TTL` seconds, so refreshing is cheap) and shows:
+Open it in a **browser** and you get a status page; scripts (`curl`, `fetch`) get JSON. If you always want the web page, open **`/status`** (or the site root `/`): it is always an HTML page. `/health?format=json` always gives JSON. It checks every result server and every Gemini key (results are cached `HEALTH_CACHE_TTL` seconds, so refreshing is cheap) and shows:
 
 - **Result servers: X up / Y total**, with each server's state and response time
 - **Gemini keys: X alive / Y total**, split into *working*, *rate-limited* (good key, Google is throttling it for a moment), *rejected*, and *unreachable*
@@ -511,7 +511,7 @@ Always `-w 1` (one process).
 ### Render specifics
 
 - **Keys added with `/addkey` are lost on redeploy** because Render's disk is temporary. Put your keys in the `GEMINI_KEYS` environment variable (comma-separated), or attach a persistent disk and set `KEYS_FILE` to a path on it.
-- During a deploy, Render may briefly run the old and new instance together. The bot then logs `TelegramConflictError` for a few seconds and recovers on its own.
+- During a deploy, Render briefly runs the old and new instance together. Telegram allows only one polling connection per bot, so the log shows `TelegramConflictError: terminated by other getUpdates request` for a few seconds, then `Connection established`. That is harmless. If it **keeps repeating for minutes**, another copy is running with the same `BOT_TOKEN` (your PC, another Render service, an old deploy): stop it.
 - Use `/ready` as the health check path. Keep one instance only.
 
 ### Good to know
