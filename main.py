@@ -928,6 +928,7 @@ class Site:
 SITES = [
     Site("eboardresults.com", "https://eboardresults.com"),
     Site("educationboardresults.gov.bd", "https://educationboardresults.gov.bd"),
+    Site("eduboardresults.gov.bd", "https://eduboardresults.gov.bd"),
 ]
 
 class SiteBalancer:
